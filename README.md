@@ -34,7 +34,7 @@ TypeScript 版の実験（`ai-yagni-data`）を Rust に移したものです。
 | `columns_named_only_in(names, tables)` | その名前（か `_名前` で終わる名前）の列が、tables の外にない |
 | `unique_on` | 列の並びに一意索引（主キーを含む）がある |
 | `foreign_key` | 外部キーがある |
-| `references_to(t, OnDelete::Cascade)` | t を指す外部キーが、どれも削除時にその動きをする |
+| `references_to(t, &[OnDelete::Cascade])` | t を指す外部キーが、どれも削除時にそのどれかの動きをする |
 | `check_exists` / `guarded_against` | 名前の付いた CHECK 制約や、BEFORE トリガーがある |
 | `sql_empty(SqlFile, names)` | SELECT（違反する行を返すように書く）が空。`{{名前}}` に表名・列名を差し込める |
 | `all` / `any` / `not` | 合成 |

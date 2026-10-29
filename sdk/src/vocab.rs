@@ -459,15 +459,16 @@ pub fn foreign_key(table: &str, columns: &[&str], ref_table: &str, ref_columns: 
     })
 }
 
-/// ref_table を指す外部キーが、どれも削除時に rule で動くこと（指すものがなければ成り立つ）。
-pub fn references_to(ref_table: &str, rule: OnDelete) -> Fact {
+/// ref_table を指す外部キーが、どれも削除時に rules のどれかで動くこと（指すものがなければ成り立つ）。
+/// MySQL は ON DELETE を書かない外部キーを NO ACTION（InnoDB では RESTRICT と同じ）と報告する。
+pub fn references_to(ref_table: &str, rules: &[OnDelete]) -> Fact {
     let rt = ref_table.to_owned();
-    Fact::new(format!("every foreign key into {ref_table} is ON DELETE {}", rule.rule()), move |db| match foreign_keys(
-        db,
-    ) {
+    let names: Vec<&'static str> = rules.iter().map(|r| r.rule()).collect();
+    let says = format!("every foreign key into {ref_table} is ON DELETE {}", names.join(" or "));
+    Fact::new(says, move |db| match foreign_keys(db) {
         Ok(fks) => Verdict(
             fks.iter()
-                .filter(|k| k.ref_table == rt && k.delete_rule != rule.rule())
+                .filter(|k| k.ref_table == rt && !names.contains(&k.delete_rule.as_str()))
                 .map(|k| format!("{}({}) → {rt} is ON DELETE {}", k.table, k.columns.replace(',', ", "), k.delete_rule))
                 .collect(),
         ),

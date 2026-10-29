@@ -220,6 +220,31 @@ impl Drop for Server {
     }
 }
 
+/// MySQL を 1 つ立て、`AI_YAGNI_MYSQL` にそのコンテナ名を入れて args のコマンドを走らせ、終わったら止める。
+/// 終了コードを返す。テスト全体で 1 つのサーバーを共有するために、利用者の小さな bin から呼ぶ（`with-mysql cargo test`）。
+pub fn with_server(args: &[String]) -> i32 {
+    let Some((cmd, rest)) = args.split_first() else {
+        eprintln!("usage: with-mysql <command> [args...]");
+        return 2;
+    };
+    let server = match Server::start() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cannot start mysql: {e}");
+            return 2;
+        }
+    };
+    let status = Command::new(cmd).args(rest).env(ENV, server.container()).status();
+    drop(server);
+    match status {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("{cmd}: {e}");
+            2
+        }
+    }
+}
+
 /// サーバーの上の 1 つのデータベース。言明はここで確かめる。
 pub struct Db<'s> {
     pub server: &'s Server,
