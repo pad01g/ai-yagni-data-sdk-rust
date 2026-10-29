@@ -3,7 +3,7 @@ DEV      := ai-yagni-data-rust-dev
 VERUS    := ai-yagni-data-verus
 NAME     := ai-yagni-data-sdk-rust
 SOCK     := -v /var/run/docker.sock:/var/run/docker.sock
-CACHE    := -v ai-yagni-data-cargo:/usr/local/cargo/registry -v $(NAME)-target:/work/target
+CACHE    := -v ai-yagni-data-cargo:/usr/local/cargo/registry -v ai-yagni-data-cargo-git:/usr/local/cargo/git -v $(NAME)-target:/work/target
 RUN      := docker run --rm $(SOCK) $(CACHE) -v $(CURDIR):/work -w /work $(DEV)
 
 .DEFAULT_GOAL := help
@@ -31,7 +31,7 @@ fmt: image ## 整形する
 	$(RUN) cargo fmt --all
 
 verify: verus-image ## Verus で証明を確かめる（verified/）
-	docker run --rm --platform linux/amd64 -v ai-yagni-data-verus-cargo:/opt/cargo/registry \
+	docker run --rm --platform linux/amd64 -v ai-yagni-data-verus-cargo:/opt/cargo/registry -v ai-yagni-data-verus-git:/opt/cargo/git \
 	  -v $(CURDIR):/work -w /work/verified $(VERUS) cargo verus verify --target-dir /tmp/verus-target
 
 ci: lint test verify ## CI で走らせるもの全部
