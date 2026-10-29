@@ -1,0 +1,17 @@
+[package]
+name = "ai-yagni-data-sdk"
+description = "データ（SQL）の未来の変更を宣言し、それを閉じる変更を CI で止める SDK（層0・層1と検査）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "ai_yagni_data_sdk"
+
+[dependencies]
+ai-yagni-data-sdk-verified = { path = "../verified", version = "0.1.0" }
+
+[lints]
+workspace = true

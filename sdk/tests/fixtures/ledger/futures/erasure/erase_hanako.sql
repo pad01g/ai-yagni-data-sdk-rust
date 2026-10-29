@@ -1,0 +1,2 @@
+UPDATE accounts SET name = NULL, email = NULL, erased_at = '2027-01-01 00:00:00.000'
+  WHERE id = '00000000-0000-4000-8000-0000000000a1';

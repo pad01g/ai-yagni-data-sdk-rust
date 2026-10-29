@@ -1,0 +1,1 @@
+UPDATE accounts SET name = '別人' WHERE id = '00000000-0000-4000-8000-0000000000a1';

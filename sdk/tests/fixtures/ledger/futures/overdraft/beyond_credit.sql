@@ -1,0 +1,1 @@
+UPDATE accounts SET balance = -1 WHERE id = '00000000-0000-4000-8000-0000000000a3';

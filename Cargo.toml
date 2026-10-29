@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["sdk", "verified"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/pad01g/ai-yagni-data-sdk-rust"
+
+[workspace.dependencies]
+vstd = { version = "=0.0.0-2026-10-04-0306" }
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)', 'cfg(verus_keep_ghost)'] }

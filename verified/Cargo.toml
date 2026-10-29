@@ -1,0 +1,18 @@
+[package]
+name = "ai-yagni-data-sdk-verified"
+description = "SDK のうち、Verus で証明する純粋な部分（識別子の判定）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vstd.workspace = true
+
+# cargo verus verify で検証する。通常の cargo build では verus! の中の仕様と証明が消え、実行コードだけが残る。
+[package.metadata.verus]
+verify = true
+
+[lints]
+workspace = true
