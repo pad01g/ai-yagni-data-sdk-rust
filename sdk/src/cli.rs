@@ -51,7 +51,7 @@ pub fn main(project: Project, vocabulary_uses: &[&str]) -> ! {
             std::process::exit(2);
         }
     };
-    let title = project.root.file_name().map_or("project".to_owned(), |n| n.to_string_lossy().into_owned());
+    let title = project.name.clone();
     let root = project.root.clone();
     let checker = Checker::new(&server, project);
     let code = if command == Some("report") {

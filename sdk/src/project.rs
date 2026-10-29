@@ -14,6 +14,8 @@ use crate::vocab::Word;
 
 #[derive(Debug, Clone)]
 pub struct Project {
+    /// 表示する名前（既定は root のディレクトリ名）。
+    pub name: String,
     pub root: PathBuf,
     pub schema: PathBuf,
     pub fixtures: PathBuf,
@@ -29,6 +31,7 @@ impl Project {
     pub fn new(root: impl AsRef<Path>) -> Self {
         let root = root.as_ref().to_path_buf();
         Self {
+            name: root.file_name().map_or("project".to_owned(), |n| n.to_string_lossy().into_owned()),
             schema: root.join("schema.sql"),
             fixtures: root.join("fixtures"),
             futures_dir: root.join("futures"),
@@ -39,6 +42,11 @@ impl Project {
             futures: Vec::new(),
             root,
         }
+    }
+
+    pub fn name(mut self, name: &str) -> Self {
+        self.name = name.to_owned();
+        self
     }
 
     pub fn schema(mut self, file: &str) -> Self {
