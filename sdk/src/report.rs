@@ -1,5 +1,6 @@
 //! 対応表: 未来の一覧、語彙（業務の言葉 → スキーマの言明）と使う未来、未来どうしの組み合わせの表（Markdown）。
 use crate::check::Checker;
+use crate::vocab::Verdict;
 
 pub fn markdown(checker: &Checker<'_>, title: &str) -> String {
     let p = &checker.project;
@@ -33,7 +34,7 @@ pub fn markdown(checker: &Checker<'_>, title: &str) -> String {
     let ids: Vec<&str> = p.futures.iter().map(|f| f.id.as_str()).collect();
     out.extend([
         String::new(),
-        "## 組み合わせ（行の差分の後に列の差分を当てる。○ = 両方の期待が成り立つ、× = 失敗、! = 衝突を宣言）"
+        "## 組み合わせ（行の差分の後に列の差分を当てる。○ = 両方の期待が成り立つ、× = 失敗、? = 確かめられない、! = 衝突を宣言）"
             .to_owned(),
         String::new(),
         format!("| | {} |", ids.join(" | ")),
@@ -48,16 +49,27 @@ pub fn markdown(checker: &Checker<'_>, title: &str) -> String {
                 continue;
             }
             let declared = a.conflicts.iter().any(|c| c.with == b.id);
-            let problems = checker.compose(a, b);
-            cells.push(format!("{}{}", if problems.is_empty() { "○" } else { "×" }, if declared { "!" } else { "" }));
-            if !problems.is_empty() && !declared {
-                undeclared.push(format!("- {} → {}: {}", a.id, b.id, problems[0]));
+            let verdict = checker.compose(a, b);
+            let mark = match verdict {
+                Verdict::Pass => "○",
+                Verdict::Fail(_) => "×",
+                Verdict::Error(_) => "?",
+            };
+            cells.push(format!("{mark}{}", if declared { "!" } else { "" }));
+            if let Some(first) = verdict.problems().first()
+                && (!declared || verdict.is_error())
+            {
+                undeclared.push(format!("- {} → {}: {first}", a.id, b.id));
             }
         }
         out.push(format!("| {} | {} |", a.id, cells.join(" | ")));
     }
     if !undeclared.is_empty() {
-        out.extend([String::new(), "宣言していない組み合わせの失敗（最初の理由）:".to_owned(), String::new()]);
+        out.extend([
+            String::new(),
+            "宣言していない組み合わせの失敗と、確かめられなかった組み合わせ（最初の理由）:".to_owned(),
+            String::new(),
+        ]);
         out.extend(undeclared);
     }
     out.join("\n")

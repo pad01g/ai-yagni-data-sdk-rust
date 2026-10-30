@@ -11,9 +11,21 @@
 //! [`cli::main`] を、利用者の crate の小さな bin から呼ぶ。
 pub mod check;
 pub mod cli;
+pub mod date;
 pub mod future;
 pub mod lint;
 pub mod mysql;
 pub mod project;
 pub mod report;
 pub mod vocab;
+
+/// 順序を保って重複を除く（最初に現れたものを残す）。
+pub(crate) fn unique<T: PartialEq>(xs: impl IntoIterator<Item = T>) -> Vec<T> {
+    let mut out = Vec::new();
+    for x in xs {
+        if !out.contains(&x) {
+            out.push(x);
+        }
+    }
+    out
+}

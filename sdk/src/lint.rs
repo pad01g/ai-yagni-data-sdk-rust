@@ -5,6 +5,9 @@
 //!
 //! - SQL を文字列で書かない。SQL は `.sql` ファイルに置き、`include_str!`（層2）かファイル名（層3）で渡す。
 //! - `use` してよいのは、許されたパスで始まるものだけ（層3なら SDK の `future` と、語彙のモジュール）。
+//!   `use` を書かずにコードの中でパスを書き切る（`ai_yagni_data_sdk::vocab::table_exists(..)`）のも同じ規則で見る。
+//!   コードの中のパスは、許されたパスの先頭（crate の名前）か `crate`・`std`・`core`・`alloc`・SDK で始まるものだけを見る
+//!   （`Future::new` のような、スコープにある型から始まるパスと区別できないため）。
 use std::fs;
 use std::path::Path;
 
@@ -95,12 +98,12 @@ fn scan(src: &str) -> Scanned {
             let mut text = String::new();
             while j < chars.len() && chars[j] != '"' {
                 if chars[j] == '\\' {
-                    text.push(at(j + 1));
-                    if at(j + 1) == '\n' {
-                        line += 1;
-                        code.push('\n');
-                    }
-                    j += 2;
+                    let (decoded, len) = escape(&chars[j + 1..]);
+                    let newlines = chars[j + 1..j + 1 + len].iter().filter(|&&c| c == '\n').count();
+                    line += newlines;
+                    code.extend(std::iter::repeat_n('\n', newlines));
+                    text.push_str(&decoded);
+                    j += 1 + len;
                     continue;
                 }
                 if chars[j] == '\n' {
@@ -118,7 +121,8 @@ fn scan(src: &str) -> Scanned {
         if c == '\'' {
             // 文字リテラル（'a' '\n' '\u{..}'）とライフタイム（'a）を分ける
             if at(i + 1) == '\\' {
-                let mut j = i + 2;
+                // 逃がした字（`'\''` の 2 つめの引用符も）を飛ばしてから、閉じる引用符を探す
+                let mut j = i + 3;
                 while j < chars.len() && chars[j] != '\'' {
                     j += 1;
                 }
@@ -141,26 +145,82 @@ fn scan(src: &str) -> Scanned {
     Scanned { strings, code }
 }
 
-/// 文字列が SQL の文に見えるか。
+/// 文字列の逃がし（`\` の後ろ）を読み、その字と、読んだ長さを返す。
+/// 行の継続（`\` と改行）は、後ろの空白ごと空白 1 つにする（語がつながらないように）。
+fn escape(rest: &[char]) -> (String, usize) {
+    let Some(&first) = rest.first() else { return (String::new(), 0) };
+    match first {
+        'n' => ("\n".to_owned(), 1),
+        'r' => ("\r".to_owned(), 1),
+        't' => ("\t".to_owned(), 1),
+        '0' => ("\0".to_owned(), 1),
+        'x' => {
+            let hex: String = rest.iter().skip(1).take(2).collect();
+            (u8::from_str_radix(&hex, 16).map_or(String::new(), |b| char::from(b).to_string()), 1 + hex.chars().count())
+        }
+        'u' if rest.get(1) == Some(&'{') => {
+            let close = rest.iter().position(|&c| c == '}').unwrap_or(rest.len() - 1);
+            let hex: String = rest[2.min(close)..close].iter().collect();
+            let c = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32);
+            (c.map_or(String::new(), String::from), close + 1)
+        }
+        '\n' => (" ".to_owned(), 1 + rest[1..].iter().take_while(|c| c.is_whitespace()).count()),
+        c => (c.to_string(), 1),
+    }
+}
+
+/// 文字列が SQL の文に見えるか。語の順序を、近い範囲で見る（`CREATE UNIQUE INDEX`、`UPDATE a JOIN b ... SET` など）。
 pub fn looks_like_sql(text: &str) -> bool {
     let words: Vec<String> = text
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .filter(|w| !w.is_empty())
         .map(str::to_ascii_uppercase)
         .collect();
-    let pair = |a: &str, b: &[&str]| words.windows(2).any(|w| w[0] == a && b.contains(&w[1].as_str()));
-    let select_from =
-        words.iter().position(|w| w == "SELECT").is_some_and(|s| words[s + 1..].iter().any(|w| w == "FROM"));
-    let update_set = words.windows(3).any(|w| w[0] == "UPDATE" && w[2] == "SET");
-    let ddl = ["ALTER", "CREATE", "DROP", "TRUNCATE"]
-        .iter()
-        .any(|v| pair(v, &["TABLE", "INDEX", "TRIGGER", "VIEW", "DATABASE"]));
-    select_from || pair("INSERT", &["INTO"]) || pair("DELETE", &["FROM"]) || update_set || ddl
+    // a の後ろ window 語以内に bs のどれかがある
+    let near = |a: &str, bs: &[&str], window: usize| {
+        words
+            .iter()
+            .enumerate()
+            .any(|(i, w)| w == a && words.iter().skip(i + 1).take(window).any(|x| bs.contains(&x.as_str())))
+    };
+    let objects = ["TABLE", "INDEX", "TRIGGER", "VIEW", "DATABASE", "SCHEMA", "PROCEDURE", "FUNCTION", "EVENT"];
+    near("SELECT", &["FROM"], usize::MAX)
+        || near("INSERT", &["INTO"], 3)
+        || near("REPLACE", &["INTO"], 3)
+        || near("UPDATE", &["SET"], 12)
+        || near("DELETE", &["FROM"], 6)
+        || ["ALTER", "CREATE", "DROP", "TRUNCATE", "RENAME"].iter().any(|v| near(v, &objects, 4))
+}
+
+/// use の木から `as 別名` を葉ごとに落とし、空白を除く（`a::{b as c, d}` → `a::{b,d}`）。
+fn strip_aliases(tree: &str) -> String {
+    // 語（英数字と _ の並び）と、空白でない記号 1 字ずつに分ける
+    let mut tokens: Vec<String> = Vec::new();
+    let mut word = false;
+    for c in tree.chars() {
+        let is_word = c.is_alphanumeric() || c == '_';
+        match tokens.last_mut() {
+            Some(t) if is_word && word => t.push(c),
+            _ if !c.is_whitespace() => tokens.push(c.to_string()),
+            _ => {}
+        }
+        word = is_word;
+    }
+    let mut out = String::new();
+    let mut it = tokens.into_iter();
+    while let Some(t) = it.next() {
+        if t == "as" {
+            it.next();
+        } else {
+            out.push_str(&t);
+        }
+    }
+    out
 }
 
 /// `use a::{b, c::{d, e}};` を `a::b`, `a::c::d`, `a::c::e` に開く。
 fn expand(tree: &str) -> Vec<String> {
-    let tree: String = tree.chars().filter(|c| !c.is_whitespace()).collect();
+    let tree = strip_aliases(tree);
     let Some(open) = tree.find('{') else {
         return vec![tree];
     };
@@ -191,9 +251,10 @@ fn expand(tree: &str) -> Vec<String> {
         .collect()
 }
 
-/// コードの中の use の対象（行番号つき）。
-fn uses(code: &str) -> Vec<(usize, String)> {
+/// コードの中の use の対象（行番号つき）と、use の文を空白にしたコード（改行は残す）。
+fn uses(code: &str) -> (Vec<(usize, String)>, String) {
     let mut out = Vec::new();
+    let mut rest = String::new();
     let mut line = 1;
     let bytes: Vec<char> = code.chars().collect();
     let mut i = 0;
@@ -215,13 +276,53 @@ fn uses(code: &str) -> Vec<(usize, String)> {
                 tree.push(bytes[j]);
                 j += 1;
             }
-            let tree = tree.trim();
-            let tree = tree.split(" as ").next().unwrap_or(tree);
-            out.extend(expand(tree).into_iter().map(|p| (start_line, p)));
+            rest.extend(tree.chars().filter(|&c| c == '\n'));
+            out.extend(expand(tree.trim()).into_iter().map(|p| (start_line, p)));
             i = j;
             continue;
         }
+        rest.push(bytes[i]);
         i += 1;
+    }
+    (out, rest)
+}
+
+/// コードの中で書き切ったパス（`a::b::c`、2 つ以上の部分）を、行番号つきで返す。先頭の `::` は落とす。
+fn paths(code: &str) -> Vec<(usize, String)> {
+    let chars: Vec<char> = code.chars().collect();
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut out = Vec::new();
+    let (mut line, mut i) = (1, 0);
+    while i < chars.len() {
+        if chars[i] == '\n' {
+            line += 1;
+        }
+        let starts = is_ident(chars[i]) && !chars[i].is_ascii_digit() && (i == 0 || !is_ident(chars[i - 1]));
+        if !starts {
+            i += 1;
+            continue;
+        }
+        let mut segments = Vec::new();
+        let mut j = i;
+        loop {
+            let from = j;
+            while j < chars.len() && is_ident(chars[j]) {
+                j += 1;
+            }
+            segments.push(chars[from..j].iter().collect::<String>());
+            if chars.get(j) == Some(&':')
+                && chars.get(j + 1) == Some(&':')
+                && chars.get(j + 2).is_some_and(|&c| is_ident(c))
+            {
+                j += 2;
+            } else {
+                break;
+            }
+        }
+        if segments.len() > 1 {
+            out.push((line, segments.join("::")));
+        }
+        i = j;
     }
     out
 }
@@ -230,9 +331,22 @@ fn uses(code: &str) -> Vec<(usize, String)> {
 pub fn source(src: &str, shown: &str, allowed: &[&str]) -> Vec<String> {
     let s = scan(src);
     let mut out = Vec::new();
-    for (line, path) in uses(&s.code) {
-        let ok = allowed.iter().any(|a| path == *a || path.starts_with(&format!("{a}::")));
-        if !ok {
+    let ok = |path: &str| allowed.iter().any(|a| path == *a || path.starts_with(&format!("{a}::")));
+    let (used, code) = uses(&s.code);
+    for (line, path) in used {
+        if !ok(&path) {
+            out.push(format!("{shown}:{line}: may not use {path}"));
+        }
+    }
+    // コードの中のパスは、crate の根から書いたと分かるものだけを見る
+    let roots: Vec<&str> = allowed
+        .iter()
+        .map(|a| a.split("::").next().unwrap_or(a))
+        .chain(["crate", "std", "core", "alloc", "ai_yagni_data_sdk"])
+        .collect();
+    for (line, path) in paths(&code) {
+        let root = path.split("::").next().unwrap_or("");
+        if roots.contains(&root) && !ok(&path) {
             out.push(format!("{shown}:{line}: may not use {path}"));
         }
     }
@@ -252,11 +366,17 @@ pub fn file(path: &Path, shown: &str, allowed: &[&str]) -> Vec<String> {
     }
 }
 
-/// ディレクトリの下の .rs をすべて確かめる（層2のフレームワーク）。
+/// ディレクトリの下の .rs をすべて確かめる（層2のフレームワーク）。symlink の輪は 1 度だけたどる。
 pub fn dir(root: &Path, allowed: &[&str]) -> Vec<String> {
     let mut files = Vec::new();
+    let mut seen = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(d) = stack.pop() {
+        let real = d.canonicalize().unwrap_or_else(|_| d.clone());
+        if seen.contains(&real) {
+            continue;
+        }
+        seen.push(real);
         let Ok(entries) = fs::read_dir(&d) else { continue };
         for e in entries.flatten() {
             let p = e.path();
@@ -305,5 +425,66 @@ mod tests {
         assert!(looks_like_sql("insert into t values (1)"));
         assert!(!looks_like_sql("select the product you want"));
         assert!(!looks_like_sql("注文は顧客を ID で指す"));
+        for sql in [
+            "CREATE UNIQUE INDEX i ON t (a)",
+            "CREATE TEMPORARY TABLE x (a INT)",
+            "CREATE OR REPLACE VIEW v AS SELECT 1",
+            "INSERT IGNORE INTO t VALUES (1)",
+            "INSERT LOW_PRIORITY IGNORE INTO t VALUES (1)",
+            "REPLACE INTO t VALUES (1)",
+            "UPDATE db.t SET a = 1",
+            "UPDATE a AS b SET b.x = 1",
+            "UPDATE a JOIN b ON a.id = b.a_id SET a.x = b.y",
+            "DELETE a FROM a JOIN b ON a.id = b.id",
+            "DELETE t1, t2 FROM t1 JOIN t2",
+        ] {
+            assert!(looks_like_sql(sql), "{sql}");
+        }
+        assert!(!looks_like_sql("replace the label"));
+        assert!(!looks_like_sql("update the settings"));
+    }
+
+    #[test]
+    fn escapes_do_not_merge_words() {
+        let src = "let x = \"UPDATE\\taccounts\\nSET x = 1\";\nlet y = \"DELETE\\\n    FROM t\";\nlet z = \"\\u{53}ELECT 1 FROM t\";\n";
+        assert_eq!(source(src, "f.rs", &[]).len(), 3, "{:?}", source(src, "f.rs", &[]));
+    }
+
+    #[test]
+    fn an_escaped_quote_in_a_char_literal_does_not_open_a_string() {
+        let src = "let q = '\\'';\nlet s = \"DROP TABLE t\";\nlet c = '\\u{41}';\n";
+        assert_eq!(source(src, "f.rs", &[]), ["f.rs:2: SQL in a string (put it in a .sql file)"]);
+    }
+
+    #[test]
+    fn aliases_are_dropped_per_leaf() {
+        let src =
+            "use ai_yagni_data_sdk::{future::Future as F, vocab::table_exists};\nuse crate::ledger::Ledger as L;\n";
+        assert_eq!(
+            source(src, "f.rs", &["ai_yagni_data_sdk::future", "crate::ledger"]),
+            vec!["f.rs:1: may not use ai_yagni_data_sdk::vocab::table_exists"]
+        );
+        assert_eq!(expand(" a::{b as c, d::{e as _, f}}"), ["a::b", "a::d::e", "a::d::f"]);
+    }
+
+    #[test]
+    fn paths_written_out_in_code_follow_the_same_rule() {
+        let src = "use ai_yagni_data_sdk::future::Future;\nfn f() {\n    let t = ai_yagni_data_sdk::vocab::table_exists(\"x\");\n    let g = ::ai_yagni_data_sdk::future::Future::new(\"g\");\n    let s = std::fs::read(\"x\");\n    let u = Future::new(\"u\");\n    let l = crate::ledger::Ledger::new();\n}\n";
+        assert_eq!(
+            source(src, "f.rs", &["ai_yagni_data_sdk::future", "crate::ledger"]),
+            vec!["f.rs:3: may not use ai_yagni_data_sdk::vocab::table_exists", "f.rs:5: may not use std::fs::read"]
+        );
+    }
+
+    #[test]
+    fn symlink_cycles_are_followed_once() {
+        let root = std::env::temp_dir().join(format!("lint-cycle-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::write(root.join("a/x.rs"), "const S: &str = \"DROP TABLE t\";\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&root, root.join("a/loop")).unwrap();
+        assert_eq!(dir(&root, &[]).len(), 1);
+        let _ = fs::remove_dir_all(&root);
     }
 }

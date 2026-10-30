@@ -24,6 +24,8 @@ TypeScript 版の実験（`ai-yagni-data`）を Rust に移したものです。
   - 層2は `.sql` ファイルを `include_str!` で埋め込みます（`SqlFile`）。
   - 層3はファイル名で渡します。
 - 層3のソース（`futures/<id>/future.rs`）が `use` してよいのは、`ai_yagni_data_sdk::future` と語彙のモジュールだけです。
+  - `use ... as 別名` の木は葉ごとに見ます。
+  - `use` を書かずにコードの中でパスを書き切る（`ai_yagni_data_sdk::vocab::table_exists(..)`）のも、同じ規則で止めます。
 
 ## 層1の言明
 
@@ -31,14 +33,31 @@ TypeScript 版の実験（`ai-yagni-data`）を Rust に移したものです。
 |---|---|
 | `table_exists` / `column_exists` | 表や列がある |
 | `column_is(t, c, shape().kind(Kind::Integer).not_null())` | 列の型の大分類、COLUMN_TYPE、NULL を許すか |
-| `columns_named_only_in(names, tables)` | その名前（か `_名前` で終わる名前）の列が、tables の外にない |
-| `unique_on` | 列の並びに一意索引（主キーを含む）がある |
-| `foreign_key` | 外部キーがある |
+| `columns_named_only_in(names, tables)` | その名前（か `_名前` で終わる名前）の列が、tables の外にない。大文字と小文字は区別しない |
+| `unique_on` | 列の並びにちょうど一致する一意索引（主キーを含む）がある。式や列の先頭だけ（`email(10)`）を含む索引、ほかの列も含む索引は数えない |
+| `foreign_key` | 外部キーがある（同じデータベースの中の表を指すものだけ） |
 | `references_to(t, &[OnDelete::Cascade])` | t を指す外部キーが、どれも削除時にそのどれかの動きをする |
 | `check_exists` / `guarded_against` | 名前の付いた CHECK 制約や、BEFORE トリガーがある |
-| `sql_empty(SqlFile, names)` | SELECT（違反する行を返すように書く）が空。`{{名前}}` に表名・列名を差し込める |
-| `all` / `any` / `not` | 合成 |
+| `sql_empty(SqlFile, names)` | SELECT（違反する行を返すように書く）が空。`{{名前}}` に表名・列名を差し込める。ファイルはちょうど 1 つの SELECT（`WITH` で始まってもよい）で、読み取りだけのトランザクションの中で流して巻き戻す |
+| `all` / `any` / `not` | 合成。空の `all` と `any` は書き間違い |
 | `define(name, meaning, fact)` | 層2: 業務の言葉に名前を付ける（語） |
+
+言明を確かめた結果（`Verdict`）は 3 つのどれかです。
+
+| 結果 | 意味 |
+|---|---|
+| `Pass` | 成り立つ |
+| `Fail(理由)` | 成り立たない |
+| `Error(理由)` | 確かめられなかった（クエリの失敗、docker の失敗、言明の書き間違い） |
+
+`Error` は、成り立つとも成り立たないとも数えません。
+
+- `not` で裏返しても `Error` のままです。
+- `all` と `any` は、どれかが `Error` なら `Error` です（ほかが成り立っても）。
+- 検査では、`Error` は失敗として報告します。宣言した衝突が現れたとは数えません。
+
+組み立てたときに分かる書き間違い（`{{名前}}` の渡し忘れ、SELECT でない SQL、2 つ以上の文、空の合成）は、
+確かめると `Error` を返し、検査の規則の節にも 1 度だけ出ます（`Fact::flaws`）。
 
 ## 未来の宣言
 
@@ -64,16 +83,22 @@ Future::new("multi-currency")
 
 1. 規則が守られている。
    - 未来のディレクトリと宣言が 1 対 1 になっている。
-   - 日付の形、ファイルの有無、衝突の対称性が正しい。
-   - 使う語が語彙に載っている。
+   - 日付の形と範囲（`2026-02-31` や `2026-13` は通らない）、ファイルの有無、衝突の対称性が正しい。
+   - 最後に読み直した日（`reviewed`）が今日より後でない。
+   - 使う語が語彙に載っていて、語に書き間違いがない。
    - 層3のソースが規則に従っている。
 2. schema.sql と fixtures が当たり、不変条件が成り立つ。
 3. 固定クエリ（任意）が、今のスキーマで `PREPARE` できる。
 4. 各未来について、期限・実現済み・前提・差分・then・accepts・rejects を確かめる。
+   - probe（accepts と rejects）は 1 つずつ、差分を当てた新しい複製の上で流す。probe の DDL や COMMIT が、ほかの probe に漏れない。
+   - accepts を流した後も、その複製の上で then が成り立たなければならない（埋め戻しただけのデータで then が素通りしないように）。
 5. 宣言した衝突が、データの上で実際に現れる。
+   - 確かめられなかったこと（docker の失敗、「今」が作れない、語が確かめられない）は、衝突が現れたとは数えない。
+   - 組み合わせの結果は 1 度だけ計算し、`report` の表と衝突の検査で使い回す。
 6. 共変更（`--changed` を渡したとき）。
    - 未来が見張るファイルが変わったのに、未来のディレクトリが変わっていなければ失敗する。
    - 語を使う未来は、語彙のファイルを暗黙に見張る。
+   - パスは正規化して比べる（`..` や symlink を含む `--repo` でもよい）。プロジェクトの根・未来のディレクトリ・語彙・見張るファイルが `--repo` の下になければ失敗する。
 
 利用者の crate では、小さな bin から `cli::main` を呼びます。
 
@@ -85,9 +110,25 @@ fn main() {
 ```
 
 ```sh
-datafutures check [--today YYYY-MM-DD] [--changed FILE --repo DIR]
+datafutures check [--today YYYY-MM-DD] [--changed FILE [--repo DIR]]
 datafutures report    # 未来の一覧、語彙の対応表、未来どうしの組み合わせの表
 ```
+
+引数は厳密に読みます。知らないフラグ、値のないフラグ、2 度書いたフラグ、正しくない日付、`--changed` のない `--repo` は、
+使い方の誤り（終了コード 2）です。`--flag=value` の形も使えます。
+
+## MySQL のコンテナ
+
+| 環境変数 | 意味 |
+|---|---|
+| `AI_YAGNI_MYSQL` | 既に立っているコンテナの名前。あればそれを使い、立ても止めもしない |
+| `AI_YAGNI_MYSQL_TIMEOUT` | docker のコマンド 1 回の時間の上限（秒、既定 300）。過ぎたら止めてエラーにする（`Server::timeout` でも変えられる） |
+| `AI_YAGNI_MYSQL_STALE_MINUTES` | 新しく立てるとき、これより古い（分、既定 120）コンテナを片付ける |
+
+- 立てたコンテナには、持ち主（ホスト名とプロセス ID）と立てた時刻のラベルを付けます。
+- 新しく立てるときに、持ち主のプロセスがもういないもの（同じホストのものだけ分かる）と、古すぎるものを片付けます。
+  `AI_YAGNI_MYSQL` のコンテナは片付けません。
+- `with-mysql`（`mysql::with_server`）と `cli::main` は、SIGINT と SIGTERM を受けたら、立てたコンテナを止めてから終わります。
 
 ## Verus
 
@@ -110,7 +151,7 @@ make ci       # 全部
 
 ```toml
 [dependencies]
-ai-yagni-data-sdk = { git = "https://github.com/pad01g/ai-yagni-data-sdk-rust", tag = "v0.1.0" }
+ai-yagni-data-sdk = { git = "https://github.com/pad01g/ai-yagni-data-sdk-rust", tag = "v0.2.0" }
 ```
 
 ## ライセンス

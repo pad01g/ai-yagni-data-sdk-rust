@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::future::Future;
+use crate::unique;
 use crate::vocab::Word;
 
 #[derive(Debug, Clone)]
@@ -70,11 +71,7 @@ impl Project {
     }
 
     pub fn words(mut self, words: impl IntoIterator<Item = Word>) -> Self {
-        for w in words {
-            if !self.words.contains(&w) {
-                self.words.push(w);
-            }
-        }
+        self.words = unique(self.words.into_iter().chain(words));
         self
     }
 

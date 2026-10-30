@@ -8,13 +8,16 @@
 pub struct Row(pub Vec<(String, Option<String>)>);
 
 impl Row {
-    /// 列の値（NULL なら None。列がなくても None）。
+    /// 列の値（NULL なら None）。
+    ///
+    /// # Panics
+    ///
+    /// 列がなければ panic する（クエリの書き間違い。NULL と取り違えないように）。
     pub fn get(&self, column: &str) -> Option<&str> {
-        self.0.iter().find(|(k, _)| k == column).and_then(|(_, v)| v.as_deref())
-    }
-
-    pub fn values(&self) -> impl Iterator<Item = Option<&str>> {
-        self.0.iter().map(|(_, v)| v.as_deref())
+        match self.0.iter().find(|(k, _)| k == column) {
+            Some((_, v)) => v.as_deref(),
+            None => panic!("no column {column} in {self}"),
+        }
     }
 }
 
@@ -28,11 +31,10 @@ impl std::fmt::Display for Row {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResultSet {
-    pub statement: String,
     pub rows: Vec<Row>,
 }
 
-pub fn unescape(s: &str) -> String {
+fn unescape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(at) = rest.find('&') {
@@ -102,11 +104,11 @@ pub fn parse_result_sets(xml: &str) -> Vec<ResultSet> {
     let mut rest = xml;
     while let Some(at) = rest.find("<resultset") {
         rest = &rest[at..];
-        let Some((statement, after)) = attribute(rest, "statement") else { break };
+        let Some((_, after)) = attribute(rest, "statement") else { break };
         let Some(close) = rest[after..].find('>') else { break };
         let body_start = after + close + 1;
         if rest[..body_start - 1].ends_with('/') {
-            sets.push(ResultSet { statement: unescape(statement), rows: Vec::new() });
+            sets.push(ResultSet { rows: Vec::new() });
             rest = &rest[body_start..];
             continue;
         }
@@ -118,7 +120,7 @@ pub fn parse_result_sets(xml: &str) -> Vec<ResultSet> {
             rows.push(parse_row(&body[r + 5..r + e]));
             body = &body[r + e + 6..];
         }
-        sets.push(ResultSet { statement: unescape(statement), rows });
+        sets.push(ResultSet { rows });
         rest = &rest[(end + "</resultset>".len()).min(rest.len())..];
     }
     sets
@@ -151,5 +153,12 @@ mod tests {
         assert_eq!(sets[0].rows[0].get("b"), None);
         assert_eq!(sets[0].rows[1].get("a"), Some(""));
         assert!(sets[1].rows.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "no column c")]
+    fn a_missing_column_is_not_null() {
+        let sets = parse_result_sets(r#"<resultset statement="x"><row><field name="a">1</field></row></resultset>"#);
+        let _ = sets[0].rows[0].get("c");
     }
 }

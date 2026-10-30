@@ -6,8 +6,9 @@
 //! - requires:    今、成り立っていなければならない前提。崩れたら、今がその未来を閉じた。
 //! - change:      今に当てる差分 SQL（未来へ向かう第一歩。既定は `change.sql`）。当たらなければ、今がその未来を閉じた。
 //! - then:        差分を当てた後に成り立つこと。
-//! - accepts:     差分を当てた後の DB が受け入れる書き込み（ファイルの SQL を巻き戻すトランザクションの中で流す）。
-//! - rejects:     差分を当てた後の DB が拒む書き込み（期待するエラーの番号か SQLSTATE を書く）。
+//! - accepts:     差分を当てた後の DB が受け入れる書き込み。probe ごとに新しく作った複製の上で流し、
+//!   その後も then が成り立つことを確かめる。
+//! - rejects:     差分を当てた後の DB が拒む書き込み（期待するエラーの番号か SQLSTATE を書く）。これも probe ごとの複製の上で流す。
 //! - realized_if: 今これが成り立つなら、その未来はもう来ている。未来を消して、前提を今の検査に移すこと（strict xfail と同じ）。
 //! - expires:     この月を過ぎたら失敗する。残すか消すかを決め直すこと（todo_or_die と同じ）。
 //! - conflicts:   両立しない未来。両方の差分を続けて当てると、どちらの順でも何かが失敗しなければならない。
@@ -19,6 +20,7 @@
 //! 層3は層2の語（[`Word`]）だけを受け取る。SQL は書かず、ファイル名で渡す。
 use std::path::{Path, PathBuf};
 
+use crate::unique;
 use crate::vocab::Word;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,14 +154,6 @@ impl Future {
 
     /// 未来が使う語（材料の語を含む）。
     pub fn words(&self) -> Vec<Word> {
-        let mut out: Vec<Word> = Vec::new();
-        for w in self.requires.iter().chain(&self.then).chain(&self.realized_if) {
-            for x in w.words() {
-                if !out.contains(&x) {
-                    out.push(x);
-                }
-            }
-        }
-        out
+        unique(self.requires.iter().chain(&self.then).chain(&self.realized_if).flat_map(Word::words))
     }
 }
