@@ -4,14 +4,14 @@ version = 4
 
 [[package]]
 name = "ai-yagni-data-sdk"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ai-yagni-data-sdk-verified",
 ]
 
 [[package]]
 name = "ai-yagni-data-sdk-verified"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "vstd",
 ]

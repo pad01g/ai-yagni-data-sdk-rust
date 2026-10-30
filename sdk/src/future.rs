@@ -9,12 +9,16 @@
 //! - accepts:     差分を当てた後の DB が受け入れる書き込み。probe ごとに新しく作った複製の上で流し、
 //!   その後も then が成り立つことを確かめる。
 //! - rejects:     差分を当てた後の DB が拒む書き込み（期待するエラーの番号か SQLSTATE を書く）。これも probe ごとの複製の上で流す。
+//!   `rejects_with` は、エラーの文に含まれるはずの名前（CHECK 制約の名前、トリガーの SIGNAL の文など）も書く。
+//!   番号が合っても、ほかの制約で拒まれたのなら通さない。
 //! - realized_if: 今これが成り立つなら、その未来はもう来ている。未来を消して、前提を今の検査に移すこと（strict xfail と同じ）。
 //! - expires:     この月を過ぎたら失敗する。残すか消すかを決め直すこと（todo_or_die と同じ）。
 //! - conflicts:   両立しない未来。両方の差分を続けて当てると、どちらの順でも何かが失敗しなければならない。
 //! - reviewed:    最後に読み直した日。共変更の検査で、見張っているファイルが変わったのに未来が変わっていなければ失敗する。
-//! - watches:     見張るファイル（プロジェクトからの相対パスか、末尾 `/*` のディレクトリ）。
+//! - watches:     見張るファイル（プロジェクトからの相対パスか、末尾 `/*` のディレクトリ）。なければ規則の節で失敗する。
+//!   ディレクトリは `dir/*` と書く（`dir` や `dir/` は書き間違い）。
 //!   語を使う未来は、語彙（業務寄りのフレームワークの当てはめ）を書かなくても見張る。
+//!   差分を当てると固定クエリが PREPARE できなくなる未来は、そのクエリを見張らなければならない。
 //!
 //! 未来どうしは矛盾してよい。各未来は、ほかの未来とは独立に「今」へ当てて検査する。
 //! 層3は層2の語（[`Word`]）だけを受け取る。SQL は書かず、ファイル名で渡す。
@@ -35,6 +39,29 @@ pub struct Rejection {
     pub why: String,
     /// MySQL のエラー番号（`3819`）か SQLSTATE（`45000`）。
     pub error: String,
+    /// エラーの文に含まれるはずの名前（CHECK 制約の名前、トリガーの SIGNAL の文の一部など）。
+    pub naming: Option<String>,
+}
+
+impl Rejection {
+    /// 期待する拒み方を、人の読む形で（`3819 naming 'products_stock_nonnegative'`）。
+    pub fn expected(&self) -> String {
+        match &self.naming {
+            Some(n) => format!("{} naming '{n}'", self.error),
+            None => self.error.clone(),
+        }
+    }
+}
+
+impl Rejection {
+    pub(crate) fn new(file: &str, error: &str, naming: Option<&str>, why: &str) -> Self {
+        Self {
+            file: PathBuf::from(file),
+            why: why.to_owned(),
+            error: error.to_owned(),
+            naming: naming.map(str::to_owned),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,7 +146,14 @@ impl Future {
     }
 
     pub fn rejects(mut self, file: &str, error: &str, why: &str) -> Self {
-        self.rejects.push(Rejection { file: PathBuf::from(file), why: why.to_owned(), error: error.to_owned() });
+        self.rejects.push(Rejection::new(file, error, None, why));
+        self
+    }
+
+    /// rejects に加えて、エラーの文が naming を含むこと（`Check constraint 'naming' is violated.` の制約の名前、
+    /// トリガーが SIGNAL で返す文の一部）。番号が合っても、ほかの制約で拒まれたのなら通さない。
+    pub fn rejects_with(mut self, file: &str, error: &str, naming: &str, why: &str) -> Self {
+        self.rejects.push(Rejection::new(file, error, Some(naming), why));
         self
     }
 

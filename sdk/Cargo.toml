@@ -11,7 +11,7 @@ repository.workspace = true
 name = "ai_yagni_data_sdk"
 
 [dependencies]
-ai-yagni-data-sdk-verified = { path = "../verified", version = "0.2.0" }
+ai-yagni-data-sdk-verified = { path = "../verified", version = "0.3.0" }
 
 [lints]
 workspace = true

@@ -8,6 +8,12 @@
 //!   `use` を書かずにコードの中でパスを書き切る（`ai_yagni_data_sdk::vocab::table_exists(..)`）のも同じ規則で見る。
 //!   コードの中のパスは、許されたパスの先頭（crate の名前）か `crate`・`std`・`core`・`alloc`・SDK で始まるものだけを見る
 //!   （`Future::new` のような、スコープにある型から始まるパスと区別できないため）。
+//!   先頭の `::`（`::ai_yagni_data_sdk::future`）は落として読む。
+//!   `extern crate a as b;` の別名 `b` は `a` と読み替える。
+//! - `super::` で始まるパスは、crate 全体（`crate`）を許すときだけ使える（層3では `crate::` から書く）。
+//! - `#[path = ..]` と `include!(..)` は使えない（読み込んだファイルをこの検査が見ないため）。
+//!
+//! 字句だけで見るので、マクロが組み立てるパス（`concat_idents!` や、別の crate のマクロの中身）は見つけられない。
 use std::fs;
 use std::path::Path;
 
@@ -277,7 +283,7 @@ fn uses(code: &str) -> (Vec<(usize, String)>, String) {
                 j += 1;
             }
             rest.extend(tree.chars().filter(|&c| c == '\n'));
-            out.extend(expand(tree.trim()).into_iter().map(|p| (start_line, p)));
+            out.extend(expand(tree.trim()).into_iter().map(|p| (start_line, p.trim_start_matches("::").to_owned())));
             i = j;
             continue;
         }
@@ -327,28 +333,96 @@ fn paths(code: &str) -> Vec<(usize, String)> {
     out
 }
 
+/// `extern crate a as b;` の（別名, 元の名前）。
+fn extern_aliases(code: &str) -> Vec<(String, String)> {
+    let words: Vec<&str> =
+        code.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == ';')).filter(|w| !w.is_empty()).collect();
+    let mut out = Vec::new();
+    for (i, w) in words.iter().enumerate() {
+        if *w == "extern" && words.get(i + 1) == Some(&"crate") && words.get(i + 3) == Some(&"as") {
+            let (name, alias) = (words.get(i + 2).copied().unwrap_or(""), words.get(i + 4).copied().unwrap_or(""));
+            out.push((alias.trim_end_matches(';').to_owned(), name.trim_end_matches(';').to_owned()));
+        }
+    }
+    out
+}
+
+/// `#[path = ..]` と `include!` の行番号と、その名前。
+fn file_inclusions(code: &str) -> Vec<(usize, &'static str)> {
+    let chars: Vec<char> = code.chars().collect();
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let skip_ws = |mut k: usize| {
+        while chars.get(k).is_some_and(|c| c.is_whitespace()) {
+            k += 1;
+        }
+        k
+    };
+    let word_at = |k: usize| -> String { chars[k..].iter().take_while(|&&c| is_ident(c)).collect() };
+    let mut out = Vec::new();
+    let mut line = 1;
+    for i in 0..chars.len() {
+        if chars[i] == '\n' {
+            line += 1;
+        }
+        if chars[i] == '#' {
+            let mut k = skip_ws(i + 1);
+            if chars.get(k) == Some(&'!') {
+                k = skip_ws(k + 1);
+            }
+            if chars.get(k) == Some(&'[') && word_at(skip_ws(k + 1)) == "path" {
+                out.push((line, "#[path]"));
+            }
+        } else if (i == 0 || !is_ident(chars[i - 1]))
+            && word_at(i) == "include"
+            && chars.get(skip_ws(i + "include".len())) == Some(&'!')
+        {
+            out.push((line, "include!"));
+        }
+    }
+    out
+}
+
 /// 1 つのソースを確かめる。allowed は use してよいパスの接頭辞（`ai_yagni_data_sdk::future` など）。
 pub fn source(src: &str, shown: &str, allowed: &[&str]) -> Vec<String> {
     let s = scan(src);
     let mut out = Vec::new();
-    let ok = |path: &str| allowed.iter().any(|a| path == *a || path.starts_with(&format!("{a}::")));
+    let aliases = extern_aliases(&s.code);
+    // `extern crate a as b;` の b を a に読み替え、先頭の `::` を落とす
+    let resolve = |path: &str| -> String {
+        let path = path.trim_start_matches("::");
+        let (root, rest) = path.split_once("::").map_or((path, None), |(r, rest)| (r, Some(rest)));
+        let root = aliases.iter().find(|(alias, _)| alias == root).map_or(root, |(_, name)| name.as_str());
+        rest.map_or(root.to_owned(), |rest| format!("{root}::{rest}"))
+    };
+    let whole_crate = allowed.contains(&"crate");
+    let ok = |path: &str| {
+        (whole_crate && (path == "super" || path.starts_with("super::")))
+            || allowed.iter().any(|a| path == *a || path.starts_with(&format!("{a}::")))
+    };
     let (used, code) = uses(&s.code);
     for (line, path) in used {
+        let path = resolve(&path);
         if !ok(&path) {
             out.push(format!("{shown}:{line}: may not use {path}"));
         }
     }
     // コードの中のパスは、crate の根から書いたと分かるものだけを見る
-    let roots: Vec<&str> = allowed
+    let roots: Vec<String> = allowed
         .iter()
         .map(|a| a.split("::").next().unwrap_or(a))
-        .chain(["crate", "std", "core", "alloc", "ai_yagni_data_sdk"])
+        .chain(["crate", "super", "std", "core", "alloc", "ai_yagni_data_sdk"])
+        .map(str::to_owned)
+        .chain(aliases.iter().map(|(_, name)| name.clone()))
         .collect();
     for (line, path) in paths(&code) {
+        let path = resolve(&path);
         let root = path.split("::").next().unwrap_or("");
-        if roots.contains(&root) && !ok(&path) {
+        if roots.iter().any(|r| r == root) && !ok(&path) {
             out.push(format!("{shown}:{line}: may not use {path}"));
         }
+    }
+    for (line, what) in file_inclusions(&s.code) {
+        out.push(format!("{shown}:{line}: {what} is not allowed (the file it reads is not checked)"));
     }
     for (line, text) in &s.strings {
         if looks_like_sql(text) {
@@ -474,6 +548,24 @@ mod tests {
             source(src, "f.rs", &["ai_yagni_data_sdk::future", "crate::ledger"]),
             vec!["f.rs:3: may not use ai_yagni_data_sdk::vocab::table_exists", "f.rs:5: may not use std::fs::read"]
         );
+    }
+
+    #[test]
+    fn crate_aliases_super_and_file_inclusions_are_found() {
+        let allowed = ["ai_yagni_data_sdk::future", "crate::shop"];
+        let src = "extern crate ai_yagni_data_sdk as s;\nuse ::ai_yagni_data_sdk::future::Future;\nfn f() {\n    let _ = s::vocab::table_exists(\"x\");\n    let _ = super::helpers::raw();\n    let _ = ::ai_yagni_data_sdk::future::Future::new(\"x\");\n}\n#[path = \"../x.rs\"]\nmod x;\ninclude!(\"y.rs\");\nconst T: &str = include_str!(\"t.txt\");\nuse s::vocab::not;\n";
+        assert_eq!(
+            source(src, "f.rs", &allowed),
+            [
+                "f.rs:12: may not use ai_yagni_data_sdk::vocab::not",
+                "f.rs:4: may not use ai_yagni_data_sdk::vocab::table_exists",
+                "f.rs:5: may not use super::helpers::raw",
+                "f.rs:8: #[path] is not allowed (the file it reads is not checked)",
+                "f.rs:10: include! is not allowed (the file it reads is not checked)",
+            ]
+        );
+        // crate 全体を許すなら super:: も使える（層2のテストの `use super::*;` など）
+        assert_eq!(source("use super::*;\nfn f() { super::g(); }\n", "f.rs", &["crate"]), Vec::<String>::new());
     }
 
     #[test]

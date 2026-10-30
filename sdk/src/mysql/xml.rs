@@ -8,16 +8,21 @@
 pub struct Row(pub Vec<(String, Option<String>)>);
 
 impl Row {
+    /// 列の値（NULL なら None）。列がなければエラー（クエリの書き間違い。NULL と取り違えないように）。
+    pub fn try_get(&self, column: &str) -> Result<Option<&str>, String> {
+        match self.0.iter().find(|(k, _)| k == column) {
+            Some((_, v)) => Ok(v.as_deref()),
+            None => Err(format!("no column {column} in {self}")),
+        }
+    }
+
     /// 列の値（NULL なら None）。
     ///
     /// # Panics
     ///
-    /// 列がなければ panic する（クエリの書き間違い。NULL と取り違えないように）。
+    /// 列がなければ panic する。言明の中では [`Row::try_get`] を使い、書き間違いを `Verdict::Error` にする。
     pub fn get(&self, column: &str) -> Option<&str> {
-        match self.0.iter().find(|(k, _)| k == column) {
-            Some((_, v)) => v.as_deref(),
-            None => panic!("no column {column} in {self}"),
-        }
+        self.try_get(column).unwrap_or_else(|e| panic!("{e}"))
     }
 }
 
@@ -159,6 +164,8 @@ mod tests {
     #[should_panic(expected = "no column c")]
     fn a_missing_column_is_not_null() {
         let sets = parse_result_sets(r#"<resultset statement="x"><row><field name="a">1</field></row></resultset>"#);
+        assert_eq!(sets[0].rows[0].try_get("a"), Ok(Some("1")));
+        assert!(sets[0].rows[0].try_get("c").unwrap_err().contains("no column c"));
         let _ = sets[0].rows[0].get("c");
     }
 }

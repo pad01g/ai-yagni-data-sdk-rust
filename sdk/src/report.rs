@@ -2,6 +2,16 @@
 use crate::check::Checker;
 use crate::vocab::Verdict;
 
+/// 表の升の中身（`|` を逃がし、改行を `<br>` にする）。
+fn cell(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('|', "\\|").replace("\r\n", "<br>").replace(['\n', '\r'], "<br>")
+}
+
+/// 表の 1 行。
+fn row(cells: &[&str]) -> String {
+    format!("| {} |", cells.iter().map(|c| cell(c)).collect::<Vec<_>>().join(" | "))
+}
+
 pub fn markdown(checker: &Checker<'_>, title: &str) -> String {
     let p = &checker.project;
     let mut out = vec![
@@ -14,7 +24,7 @@ pub fn markdown(checker: &Checker<'_>, title: &str) -> String {
     ];
     for f in &p.futures {
         let with: Vec<&str> = f.conflicts.iter().map(|c| c.with.as_str()).collect();
-        out.push(format!("| {} | {} | {} | {} |", f.id, f.why, f.expires, with.join(", ")));
+        out.push(row(&[&f.id, &f.why, &f.expires, &with.join(", ")]));
     }
     out.extend([
         String::new(),
@@ -29,7 +39,7 @@ pub fn markdown(checker: &Checker<'_>, title: &str) -> String {
             users.push("(今の不変条件)".to_owned());
         }
         users.extend(p.futures.iter().filter(|f| f.words().contains(w)).map(|f| f.id.clone()));
-        out.push(format!("| {} | {} | {} | {} |", w.name(), w.meaning(), w.says(), users.join(", ")));
+        out.push(row(&[w.name(), w.meaning(), w.says(), &users.join(", ")]));
     }
     let ids: Vec<&str> = p.futures.iter().map(|f| f.id.as_str()).collect();
     out.extend([
@@ -37,7 +47,7 @@ pub fn markdown(checker: &Checker<'_>, title: &str) -> String {
         "## 組み合わせ（行の差分の後に列の差分を当てる。○ = 両方の期待が成り立つ、× = 失敗、? = 確かめられない、! = 衝突を宣言）"
             .to_owned(),
         String::new(),
-        format!("| | {} |", ids.join(" | ")),
+        row(&[&[""], ids.as_slice()].concat()),
         format!("|---|{}|", ids.iter().map(|_| "---").collect::<Vec<_>>().join("|")),
     ]);
     let mut undeclared = Vec::new();
@@ -59,10 +69,12 @@ pub fn markdown(checker: &Checker<'_>, title: &str) -> String {
             if let Some(first) = verdict.problems().first()
                 && (!declared || verdict.is_error())
             {
-                undeclared.push(format!("- {} → {}: {first}", a.id, b.id));
+                undeclared.push(format!("- {} → {}: {}", a.id, b.id, first.replace('\n', " ")));
             }
         }
-        out.push(format!("| {} | {} |", a.id, cells.join(" | ")));
+        let mut line = vec![a.id.as_str()];
+        line.extend(cells.iter().map(String::as_str));
+        out.push(row(&line));
     }
     if !undeclared.is_empty() {
         out.extend([
@@ -73,4 +85,14 @@ pub fn markdown(checker: &Checker<'_>, title: &str) -> String {
         out.extend(undeclared);
     }
     out.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cells_cannot_break_the_table() {
+        assert_eq!(row(&["a|b", "x\ny", "c\\|d"]), "| a\\|b | x<br>y | c\\\\\\|d |");
+    }
 }

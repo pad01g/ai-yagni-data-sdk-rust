@@ -28,7 +28,10 @@ use ai_yagni_data_sdk::future::Future;
 use ai_yagni_data_sdk::lint;
 use ai_yagni_data_sdk::mysql::{Db, ENV, Scratch, Server};
 use ai_yagni_data_sdk::project::Project;
-use ai_yagni_data_sdk::vocab::{Fact, SqlFile, Verdict, any, define, not, sql_empty, table_exists, unique_on};
+use ai_yagni_data_sdk::vocab::{
+    Fact, SqlFile, Verdict, any, check_exists, define, not, sql_empty, table_exists, unique_on, unique_on_not_null,
+    unique_within,
+};
 
 use ledger::Ledger;
 
@@ -75,6 +78,11 @@ fn project(root: &Path, v: &Ledger, tweak: impl Fn(Future) -> Future) -> Project
         .vocabulary("vocab/ledger.rs")
         .words(v.all())
         .invariants([&v.balance_is_derivable, &v.amounts_are_whole_points, &v.transfers_are_keyed_by_request])
+        .queries("queries")
+        .grants("grants.sql", "app", Some("ledger"))
+        .accepts("probes/new_account.sql", "残高 0 の口座は送金なしに作れる")
+        .rejects_with("probes/negative_balance.sql", "3819", "accounts_balance_nonnegative", "残高は 0 を下回らない")
+        .rejects("probes/orphan_transfer.sql", "1452", "送金の相手は、ある口座")
         .future(tweak(audit_trail::future(v)))
         .future(tweak(erasure::future(v)))
         .future(tweak(multi_currency::future(v)))
@@ -152,9 +160,12 @@ fn renaming_the_balance_floor_breaks_the_overdraft_change() {
     let root = copy_ledger();
     edit(&root, "schema.sql", "CONSTRAINT accounts_balance_nonnegative CHECK", "CONSTRAINT balance_floor CHECK");
     let r = run(&root);
-    assert_eq!(keys(&r), ["future overdraft"]);
+    assert_eq!(keys(&r), ["future overdraft", "present"]);
     let s = joined(&r, "future overdraft");
     assert!(s.contains("balance_floor_is_named") && s.contains("change does not apply"), "{s}");
+    // 今の probe は、拒んだ制約の名前も確かめる
+    let s = joined(&r, "present");
+    assert!(s.contains("with 3819 naming 'accounts_balance_nonnegative', but got 3819"), "{s}");
 }
 
 #[test]
@@ -478,12 +489,17 @@ fn personal_columns_are_found_whatever_their_case() {
 }
 
 #[test]
-fn a_statement_that_runs_too_long_is_stopped() {
+fn a_statement_that_runs_too_long_is_stopped_on_the_server_too() {
     let shared = server();
     let impatient = Server::attach(shared.container()).timeout(Duration::from_secs(2));
     let db = Scratch::create(&impatient, "slow").unwrap();
-    let e = db.db.run("SELECT SLEEP(10)").unwrap_err();
+    let e = db.db.run("SELECT SLEEP(29.25)").unwrap_err();
     assert!(e.is_other() && e.message.contains("timed out"), "{e}");
+    // docker のクライアントを止めるだけでなく、サーバーの上の問い合わせも止める
+    let still = "SELECT COUNT(*) AS n FROM information_schema.PROCESSLIST WHERE INFO LIKE 'SELECT SLEEP(29.25)%'";
+    let probe = Scratch::create(&shared, "watch").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(count(&probe.db, still), "0");
 }
 
 #[test]
@@ -501,4 +517,240 @@ fn a_word_written_wrong_is_reported_once_as_a_rules_problem() {
         checker.check_rules(&options(Path::new(FIXTURE), None, TODAY)),
         ["word broken: unnamed.sql: no name for {{accounts}}", "word nothing: any of nothing (no alternatives)"]
     );
+}
+
+// ---------------------------------------------------------------- sql_empty の SELECT は、サーバーの PREPARE で 1 文だけ流す
+
+/// 行を 1 つ持つ表 touched を作る。
+const TOUCHED: &str = "CREATE TABLE touched (n INT);\nINSERT INTO touched VALUES (1);\n";
+
+#[test]
+fn sql_empty_cannot_smuggle_a_second_statement_past_the_lexer() {
+    // mysql CLI は `\g` を「送る」と読む。サーバーは版のコメント `/*!99999 ... */` を読み飛ばす
+    const GO: SqlFile = SqlFile::new("go.sql", "SELECT n FROM touched WHERE 0 \\g COMMIT \\g DELETE FROM touched");
+    const VERSIONED: SqlFile =
+        SqlFile::new("versioned.sql", "SELECT n FROM touched WHERE 0 /*!99999 ' */; COMMIT; DELETE FROM touched; -- '");
+    on_present(TOUCHED, |db| {
+        for file in [GO, VERSIONED] {
+            let fact = sql_empty(file, &[]);
+            assert_eq!(fact.flaws(), Vec::<String>::new(), "the lexer sees one statement in {}", file.name);
+            let v = fact.holds(db);
+            assert!(v.is_error(), "{}: {v:?}", file.name);
+            assert_eq!(count(db, "SELECT COUNT(*) AS n FROM touched"), "1", "{}", file.name);
+        }
+    });
+}
+
+#[test]
+fn mysql_cli_commands_are_refused_in_every_script() {
+    let shared = server();
+    let marker = format!("/tmp/ayg-shell-{}", std::process::id());
+    let db = Scratch::create(&shared, "bang").unwrap();
+    let e = db.db.run(&format!("SELECT 1;\n\\! touch {marker}\n")).unwrap_err();
+    assert!(e.message.contains("Unknown command"), "{e}");
+    let found = std::process::Command::new("docker")
+        .args(["exec", shared.container(), "test", "-e", &marker])
+        .status()
+        .unwrap();
+    assert!(!found.success(), "the shell command ran");
+    let e = db.db.run("SELECT 1 \\g SELECT 2").unwrap_err();
+    assert!(e.is_other(), "{e}");
+}
+
+#[test]
+fn errors_carry_the_line_of_the_script() {
+    let shared = server();
+    let db = Scratch::create(&shared, "lines").unwrap();
+    let e = db.db.run("SELECT 1;\n-- 2\nSELECT nope;\n").unwrap_err();
+    assert_eq!((e.code, e.line), (Some(1054), Some(3)), "{e:?}");
+    let root = copy_ledger();
+    edit(&root, "futures/overdraft/change.sql", "DROP CHECK accounts_balance_nonnegative", "DROP CHECK nope");
+    let s = joined(&run(&root), "future overdraft");
+    assert!(s.contains("futures/overdraft/change.sql:2: Check constraint 'nope'"), "{s}");
+}
+
+// ---------------------------------------------------------------- 共変更と見張り
+
+#[test]
+fn a_changed_submodule_counts_as_a_change_of_the_watched_files_inside_it() {
+    let root = copy_ledger();
+    fs::create_dir_all(root.join("vendor/proxy/queries")).unwrap();
+    fs::write(root.join("vendor/proxy/queries/lock.sql"), "SELECT 1").unwrap();
+    let tweak = |f: Future| if f.id == "erasure" { f.watches("vendor/proxy/queries/lock.sql") } else { f };
+    // `git diff --name-only` はサブモジュールの中のファイルでなく、サブモジュールのパスだけを出す
+    let r = run_with(&root, tweak, Some(&["ledger/vendor/proxy"]), TODAY);
+    assert_eq!(keys(&r), ["cochange erasure"]);
+    assert!(r["cochange erasure"][0].starts_with("ledger/vendor/proxy changed"), "{r:?}");
+}
+
+#[test]
+fn watches_must_exist_and_directories_must_end_with_a_star() {
+    let tweak = |f: Future| {
+        if f.id == "erasure" {
+            f.watches("queries/nope.sql").watches("queries").watches("queries/").watches("queries/*")
+        } else {
+            f
+        }
+    };
+    let r = run_with(&copy_ledger(), tweak, None, TODAY);
+    assert_eq!(
+        r["rules"],
+        [
+            "erasure: watch 'queries/nope.sql': no such file",
+            "erasure: watch 'queries' is a directory (write it as queries/*)",
+            "erasure: watch 'queries/' ends with '/' (write a directory as dir/*)",
+        ]
+    );
+}
+
+// ---------------------------------------------------------------- 固定クエリは、未来の差分の後にも PREPARE し直す
+
+#[test]
+fn a_future_that_breaks_a_fixed_query_must_watch_it() {
+    let root = copy_ledger();
+    let change = root.join("futures/erasure/change.sql");
+    let mut sql = fs::read_to_string(&change).unwrap();
+    sql.push_str("ALTER TABLE daily_stats RENAME COLUMN volume TO amount;\n");
+    fs::write(&change, sql).unwrap();
+    let r = run(&root);
+    assert_eq!(keys(&r), ["future erasure"]);
+    let s = joined(&r, "future erasure");
+    assert!(s.contains("breaks the fixed query queries/daily_volume.sql but does not watch it"), "{s}");
+    for watch in ["queries/daily_volume.sql", "queries/*"] {
+        let tweak = |f: Future| if f.id == "erasure" { f.watches(watch) } else { f };
+        assert_eq!(run_with(&root, tweak, None, TODAY), BTreeMap::new(), "{watch}");
+    }
+}
+
+#[test]
+fn fixed_queries_are_prepared_with_the_grants_of_their_user() {
+    let root = copy_ledger();
+    edit(&root, "grants.sql", "GRANT SELECT (id, balance) ON", "GRANT SELECT (id) ON");
+    let r = run(&root);
+    assert_eq!(keys(&r), ["present"]);
+    let s = joined(&r, "present");
+    assert!(
+        s.contains("query queries/account_balance.sql does not prepare as app (grants.sql): SELECT command denied to user 'app'"),
+        "{s}"
+    );
+    edit(&root, "grants.sql", "GRANT SELECT (id) ON", "CREATE USER x; GRANT SELECT ON");
+    assert!(joined(&run(&root), "present").contains("only GRANT statements are allowed"));
+}
+
+// ---------------------------------------------------------------- rejects は、拒んだ制約の名前も確かめられる
+
+#[test]
+fn a_rejection_by_another_constraint_with_the_same_number_does_not_count() {
+    let root = copy_ledger();
+    // 与信枠の CHECK の名前を変えると、3819 で拒まれても名前が合わない
+    edit(
+        &root,
+        "futures/overdraft/change.sql",
+        "ADD CONSTRAINT accounts_within_credit",
+        "ADD CONSTRAINT accounts_credit_floor",
+    );
+    let r = run(&root);
+    assert_eq!(keys(&r), ["future overdraft"]);
+    let s = joined(&r, "future overdraft");
+    assert!(
+        s.contains("should reject futures/overdraft/beyond_credit.sql with 3819 naming 'accounts_within_credit'"),
+        "{s}"
+    );
+}
+
+#[test]
+fn a_reject_that_expects_the_generic_hy000_is_warned_about() {
+    let server = server();
+    let v = Ledger::new();
+    let tweak =
+        |f: Future| if f.id == "audit-trail" { f.rejects("rewrite_amount.sql", "HY000", "何でも通る") } else { f };
+    let checker = Checker::new(&server, project(&copy_ledger(), &v, tweak));
+    let w = checker.warnings();
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].starts_with("audit-trail: rejects futures/audit-trail/rewrite_amount.sql expects HY000"), "{w:?}");
+}
+
+// ---------------------------------------------------------------- 今の probe
+
+#[test]
+fn present_probes_check_what_constraints_and_triggers_do_today() {
+    let root = copy_ledger();
+    edit(&root, "probes/negative_balance.sql", "SET balance = -1", "SET balance = 5");
+    edit(&root, "probes/new_account.sql", "'carol@example.com', 0,", "'carol@example.com', 9,");
+    let s = joined(&run(&root), "present");
+    assert!(s.contains("present: should reject probes/negative_balance.sql"), "{s}");
+    assert!(s.contains("invariants after probes/new_account.sql: balance_is_derivable"), "{s}");
+}
+
+#[test]
+fn a_fixture_that_turns_off_foreign_key_checks_does_not_leak_into_the_probes() {
+    let root = copy_ledger();
+    fs::write(root.join("fixtures/0002_session.sql"), "SET FOREIGN_KEY_CHECKS = 0;\n").unwrap();
+    assert_eq!(run(&root), BTreeMap::new());
+}
+
+// ---------------------------------------------------------------- データベースの外を変える文
+
+#[test]
+fn statements_that_change_the_server_are_rules_problems() {
+    let root = copy_ledger();
+    fs::write(root.join("fixtures/0002_global.sql"), "SET GLOBAL max_connections = 500;\n").unwrap();
+    edit(
+        &root,
+        "futures/overdraft/within_credit.sql",
+        "UPDATE accounts SET credit_limit",
+        "USE mysql;\nUPDATE ledger.accounts SET credit_limit",
+    );
+    let r = run_with(&root, |f| f, None, TODAY);
+    let rules = &r["rules"];
+    assert!(rules.contains(&"fixtures/0002_global.sql: statement 1 changes the server, not only this database (SET GLOBAL / SET PERSIST)".to_owned()), "{rules:?}");
+    assert!(
+        rules.contains(
+            &"futures/overdraft/within_credit.sql: statement 1 changes the server, not only this database (USE)"
+                .to_owned()
+        ),
+        "{rules:?}"
+    );
+}
+
+// ---------------------------------------------------------------- 一意性: 列の集合、列の一部、NULL
+
+#[test]
+fn unique_on_compares_column_sets_and_unique_within_sees_narrower_indexes() {
+    let extra = "ALTER TABLE transfers ADD UNIQUE KEY by_pair (to_id, from_id);\n\
+                 ALTER TABLE transfers ADD UNIQUE KEY by_from (from_id);";
+    on_present(extra, |db| {
+        // 順序と大文字小文字は問わない
+        assert!(unique_on("transfers", &["from_id", "to_id"]).holds(db).ok());
+        assert!(unique_on("transfers", &["FROM_ID", "To_Id"]).holds(db).ok());
+        // from_id だけの一意索引があれば、(from_id, amount) の組も一意。not(unique_on) はそれを見落とす
+        assert!(not(unique_on("transfers", &["from_id", "amount"])).holds(db).ok());
+        assert!(!not(unique_within("transfers", &["from_id", "amount"])).holds(db).ok());
+        assert!(not(unique_within("transfers", &["amount", "created_at"])).holds(db).ok());
+        // 一意索引は NULL を何行でも許す
+        assert!(unique_on("transfers", &["from_id"]).holds(db).ok());
+        let v = unique_on_not_null("transfers", &["from_id"]).holds(db);
+        assert_eq!(v.problems(), ["transfers.from_id is nullable"]);
+        assert!(unique_on_not_null("accounts", &["id"]).holds(db).ok());
+    });
+}
+
+#[test]
+fn a_check_that_is_not_enforced_does_not_count() {
+    let fact = check_exists("accounts", "accounts_balance_nonnegative");
+    assert!(holds("", &fact).ok());
+    let v = holds("ALTER TABLE accounts ALTER CHECK accounts_balance_nonnegative NOT ENFORCED", &fact);
+    assert_eq!(v.problems(), ["no enforced check accounts_balance_nonnegative on accounts"]);
+}
+
+#[test]
+fn a_typo_in_a_column_name_is_an_error_not_a_panic() {
+    let typo = Fact::new("typo", |db| match db.query("SELECT 1 AS n") {
+        Ok(rows) => match rows[0].try_get("m") {
+            Ok(_) => Verdict::pass(),
+            Err(e) => Verdict::error(e),
+        },
+        Err(e) => Verdict::error(e.to_string()),
+    });
+    assert!(holds("", &typo).is_error());
 }

@@ -2,6 +2,10 @@
 //! 文字列は 16 進のリテラルに文字セットを付けて書く（`_utf8mb4 X'..'`）。SQL モード（NO_BACKSLASH_ESCAPES）に左右されない。
 //!
 //! スクリプトを文に分けるのも、ここで字句を読んで行う（引用・コメント・`DELIMITER` を mysql CLI と同じように扱う）。
+//!
+//! ただし、字句の読み方は mysql CLI やサーバーと完全には一致しない（`/*!99999 ... */` の版のコメント、CLI のコマンドなど）。
+//! そこで、1 つの文だけを流したいとき（`sql_empty` と固定クエリ）は、文を 16 進のリテラルにしてサーバーへ渡し、
+//! サーバーの `PREPARE` に読ませる（[`server_side`]）。`PREPARE` は 2 つ以上の文を拒む。
 
 /// 文字列のリテラル。
 pub fn literal(v: &str) -> String {
@@ -16,6 +20,13 @@ pub fn ident(name: &str) -> Result<String, String> {
     } else {
         Err(format!("bad identifier: {name}"))
     }
+}
+
+/// 文をサーバーの側で読ませる 1 行（`SET @q = <16 進>; PREPARE q FROM @q;`）。
+/// execute なら続けて流し（`EXECUTE`）、片付ける。クライアントの字句の読み方に左右されない。
+pub(crate) fn server_side(statement: &str, execute: bool) -> String {
+    let prepare = format!("SET @ai_yagni_q = {}; PREPARE ai_yagni_q FROM @ai_yagni_q;", literal(statement));
+    if execute { format!("{prepare} EXECUTE ai_yagni_q; DEALLOCATE PREPARE ai_yagni_q;") } else { prepare }
 }
 
 /// スクリプトを字句で読んだ結果。
@@ -164,6 +175,161 @@ pub(crate) fn first_word(statement: &str) -> String {
     chars[i..].iter().take_while(|c| c.is_ascii_alphanumeric() || **c == '_').collect::<String>().to_ascii_uppercase()
 }
 
+/// スクリプトの文（区切りを除く。閉じていない最後の文も含む）。
+pub(crate) fn statements(script: &str) -> Vec<String> {
+    let lexed = lex(script);
+    let mut out = lexed.statements;
+    out.extend(lexed.pending);
+    out
+}
+
+/// 文の語（大文字にする）。引用とコメントは飛ばし、版のコメント（`/*!80000 ... */`）の中身は語として読む。
+/// `@@GLOBAL.x` は `@@GLOBAL` という 1 語にする。
+fn words(statement: &str) -> Vec<String> {
+    let chars: Vec<char> = statement.chars().collect();
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '/' && chars.get(i + 1) == Some(&'*') && chars.get(i + 2) == Some(&'!') {
+            i += 3;
+            while chars.get(i).is_some_and(char::is_ascii_digit) {
+                i += 1;
+            }
+        } else if c == '*' && chars.get(i + 1) == Some(&'/') {
+            i += 2;
+        } else if let Some(end) = comment_end(&chars, i) {
+            i = end;
+        } else if matches!(c, '\'' | '"' | '`') {
+            i = quote_end(&chars, i);
+        } else if c == '@' && chars.get(i + 1) == Some(&'@') {
+            let end = (i + 2..chars.len()).find(|&k| !is_word(chars[k])).unwrap_or(chars.len());
+            out.push(chars[i..end].iter().collect::<String>().to_ascii_uppercase());
+            i = end;
+        } else if is_word(c) {
+            let end = (i..chars.len()).find(|&k| !is_word(chars[k])).unwrap_or(chars.len());
+            out.push(chars[i..end].iter().collect::<String>().to_ascii_uppercase());
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 文が、そのデータベースの外（サーバー全体）を変えるなら、その種類（`SET GLOBAL` など）。
+/// 検査はデータベースだけを分けるので、サーバーの設定・利用者・権限・ほかのデータベースを変える文は、
+/// ほかの検査に漏れる。字句だけで見る（ストアドプロシージャやトリガーの本体の中までは見ない）。
+pub(crate) fn server_wide(statement: &str) -> Option<String> {
+    let w = words(statement);
+    let at = |k: usize| w.get(k).map_or("", String::as_str);
+    let (first, second) = (at(0), at(1));
+    let global = ["GLOBAL", "PERSIST", "PERSIST_ONLY", "@@GLOBAL", "@@PERSIST", "@@PERSIST_ONLY"];
+    let found = match first {
+        "SET" if w.iter().any(|x| global.contains(&x.as_str())) => "SET GLOBAL / SET PERSIST",
+        "SET" if matches!(second, "PASSWORD" | "DEFAULT" | "RESOURCE") => "SET PASSWORD / SET DEFAULT ROLE",
+        "USE" => "USE",
+        "GRANT" => "GRANT",
+        "REVOKE" => "REVOKE",
+        "CREATE" | "DROP" | "ALTER" | "RENAME" if matches!(second, "USER" | "ROLE") => "a user or a role",
+        "CREATE" | "DROP" if matches!(second, "DATABASE" | "SCHEMA") => "CREATE / DROP DATABASE",
+        "CREATE" | "DROP" | "ALTER"
+            if matches!(second, "TABLESPACE" | "SERVER" | "LOGFILE" | "RESOURCE" | "SPATIAL") =>
+        {
+            "a server-wide object"
+        }
+        "INSTALL" | "UNINSTALL" => "a plugin or a component",
+        "SHUTDOWN" | "RESTART" | "KILL" | "FLUSH" | "RESET" | "PURGE" | "CHANGE" => "server administration",
+        "START" | "STOP" if matches!(second, "REPLICA" | "SLAVE" | "GROUP_REPLICATION") => "replication",
+        _ if w.windows(2).any(|p| p[0] == "INTO" && matches!(p[1].as_str(), "OUTFILE" | "DUMPFILE")) => {
+            "INTO OUTFILE / DUMPFILE"
+        }
+        _ => return None,
+    };
+    Some(found.to_owned())
+}
+
+/// 権限のファイル（GRANT の文だけ）を、検査の使い捨てのデータベースと利用者に向けて書き換える。
+///
+/// - `{{database}}` を database（識別子）にする。
+/// - schema があれば、その名前で修飾した表（`shop.orders`、`` `shop`.* ``）の修飾を database にする。
+/// - user（`'proxy'@'%'` の `proxy`。引用してもしなくてもよい）を、scratch_user（`'名前'@'%'`）にする。
+pub(crate) fn rewrite_grants(
+    script: &str,
+    user: &str,
+    schema: Option<&str>,
+    scratch_user: &str,
+    database: &str,
+) -> Result<String, String> {
+    for s in statements(script) {
+        let w = first_word(&s);
+        if w != "GRANT" {
+            return Err(format!("only GRANT statements are allowed, not {w}"));
+        }
+    }
+    let chars: Vec<char> = script.chars().collect();
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
+    let skip_ws = |mut k: usize| {
+        while chars.get(k).is_some_and(|c| c.is_whitespace()) {
+            k += 1;
+        }
+        k
+    };
+    // `@` の後ろのホスト（引用か、空白と区切りまでの字）の終わり
+    let host_end = |k: usize| {
+        let k = skip_ws(k);
+        match chars.get(k) {
+            Some('\'' | '"' | '`') => quote_end(&chars, k),
+            _ => (k..chars.len())
+                .find(|&j| !(is_word(chars[j]) || matches!(chars[j], '%' | '.' | '-')))
+                .unwrap_or(chars.len()),
+        }
+    };
+    let db = ident(database)?;
+    let mut out = String::with_capacity(script.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i..].starts_with(&['{', '{']) {
+            let close = chars[i..].windows(2).position(|w| w == ['}', '}']).map(|n| i + n);
+            let inner: Option<String> = close.map(|c| chars[i + 2..c].iter().collect());
+            if let (Some(c), Some("database")) = (close, inner.as_deref().map(str::trim)) {
+                out.push_str(&db);
+                i = c + 2;
+                continue;
+            }
+        }
+        if let Some(end) = comment_end(&chars, i) {
+            out.extend(&chars[i..end]);
+            i = end;
+            continue;
+        }
+        let (end, name) = if matches!(chars[i], '\'' | '"' | '`') {
+            let end = quote_end(&chars, i);
+            (end, chars[i + 1..end.saturating_sub(1).max(i + 1)].iter().collect::<String>())
+        } else if is_word(chars[i]) && (i == 0 || !(is_word(chars[i - 1]) || chars[i - 1] == '.')) {
+            let end = (i..chars.len()).find(|&k| !is_word(chars[k])).unwrap_or(chars.len());
+            (end, chars[i..end].iter().collect::<String>())
+        } else {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        };
+        let after = skip_ws(end);
+        if name == user && chars.get(after) == Some(&'@') {
+            out.push_str(&format!("'{scratch_user}'@'%'"));
+            i = host_end(after + 1);
+        } else if schema == Some(name.as_str()) && chars.get(end) == Some(&'.') && chars[i] != '\'' && chars[i] != '"' {
+            out.push_str(&db);
+            i = end;
+        } else {
+            out.extend(&chars[i..end]);
+            i = end;
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +377,52 @@ mod tests {
         assert!(single_statement("DELIMITER $$\nSELECT 1$$\n").is_err());
         assert_eq!(first_word("-- x\n/* y */ select 1"), "SELECT");
         assert_eq!(first_word("(SELECT 1)"), "(");
+    }
+
+    #[test]
+    fn statements_go_to_the_server_as_a_hex_literal() {
+        let line = server_side("SELECT 1 /*!99999 ' */; COMMIT; -- '", true);
+        assert!(!line.contains("COMMIT") && line.contains("EXECUTE ai_yagni_q"), "{line}");
+        assert_eq!(line.lines().count(), 1);
+        assert!(!server_side("SELECT 1", false).contains("EXECUTE"));
+    }
+
+    #[test]
+    fn statements_that_reach_beyond_the_database_are_found() {
+        for (sql, found) in [
+            ("SET GLOBAL max_connections = 10", true),
+            ("set @@global.sql_mode = ''", true),
+            ("SET SESSION sql_mode = '', PERSIST x = 1", true),
+            ("/*!80000 SET GLOBAL x = 1 */", true),
+            ("SET SESSION innodb_lock_wait_timeout = 5", false),
+            ("SET @x = 'GLOBAL'", false),
+            ("USE other", true),
+            ("CREATE USER 'u'@'%'", true),
+            ("GRANT SELECT ON *.* TO 'u'@'%'", true),
+            ("DROP DATABASE shop", true),
+            ("drop schema if exists x", true),
+            ("SELECT * FROM t INTO OUTFILE '/tmp/x'", true),
+            ("CREATE TABLE users (id INT)", false),
+            ("ALTER TABLE t ADD COLUMN `global` INT", false),
+            ("INSERT INTO t VALUES ('DROP DATABASE x')", false),
+            ("-- USE x\nSELECT 1", false),
+        ] {
+            assert_eq!(server_wide(sql).is_some(), found, "{sql}");
+        }
+    }
+
+    #[test]
+    fn grants_are_pointed_at_the_scratch_database_and_user() {
+        let src = "-- 'proxy'@'%' の権限\nGRANT SELECT ON shop.customers TO 'proxy'@'%';\n\
+                   GRANT INSERT (a, b) ON `shop`.orders TO proxy@'%';\nGRANT SELECT ON {{database}}.x TO \"proxy\" @ \"%\";\n\
+                   GRANT SELECT ON shopping.t TO 'proxy'@'%';\n";
+        let out = rewrite_grants(src, "proxy", Some("shop"), "ayg_1", "db_1").unwrap();
+        assert_eq!(
+            out,
+            "-- 'proxy'@'%' の権限\nGRANT SELECT ON `db_1`.customers TO 'ayg_1'@'%';\n\
+             GRANT INSERT (a, b) ON `db_1`.orders TO 'ayg_1'@'%';\nGRANT SELECT ON `db_1`.x TO 'ayg_1'@'%';\n\
+             GRANT SELECT ON shopping.t TO 'ayg_1'@'%';\n"
+        );
+        assert!(rewrite_grants("CREATE USER x;", "proxy", None, "u", "d").is_err());
     }
 }

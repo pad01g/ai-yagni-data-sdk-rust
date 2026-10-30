@@ -6,6 +6,8 @@
 //! ```
 //!
 //! 変わったファイルの一覧は、リポジトリの根（--repo、省略するとプロジェクトの根）からの相対パス。
+//! `git diff --name-only --no-renames BASE...HEAD` で作る（`--no-renames` がないと、名前を変えたファイルの元の名前が
+//! 出ず、それを見張る未来が見落とされる）。サブモジュールは、そのディレクトリの名前で出てよい。
 //! check は CI で走らせる。失敗があれば終了コード 1。report は対応表を出す（失敗しない）。
 //! 知らないフラグ、値のないフラグ、2 度書いたフラグ、正しくない日付は使い方の誤り（終了コード 2）。
 //! サーバーは `AI_YAGNI_MYSQL` のものを使い、なければ立てて終わりに止める（SIGINT・SIGTERM でも止める）。
@@ -126,6 +128,9 @@ pub fn main(project: Project, vocabulary_uses: &[&str]) -> ! {
             };
             let r = checker.run(&opts);
             println!("== {title}");
+            for w in &r.warnings {
+                println!("warn {w}");
+            }
             for s in &r.sections {
                 println!("{} {}", if s.problems.is_empty() { "ok  " } else { "FAIL" }, s.name);
                 for p in &s.problems {
